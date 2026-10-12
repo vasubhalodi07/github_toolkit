@@ -4,9 +4,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_JSON="$SCRIPT_DIR/source.json"
 
-# Load local environment variables (API keys, models) if present with auto-export
+# Load local environment variables (API keys, models, tokens) if present
 if [ -f "$SCRIPT_DIR/.env" ]; then
   set -a
   # shellcheck disable=SC1091
@@ -14,300 +13,312 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   set +a
 fi
 
-echo "=========================================="
-echo " 🚀 Create Pull Request Script"
-echo "=========================================="
-
-# 1. Check if source.json exists
-if [ ! -f "$SOURCE_JSON" ]; then
-  echo "❌ Error: Configuration file 'source.json' not found at:"
-  echo "   $SOURCE_JSON"
-  exit 1
-fi
-
-# 2. Parse projects from source.json
-PROJECT_NAMES=()
-PROJECT_PATHS=()
-PROJECT_REPOS=()
-
-if command -v jq &> /dev/null; then
-  while IFS=$'\t' read -r name path repo; do
-    if [ -n "$name" ]; then
-      PROJECT_NAMES+=("$name")
-      PROJECT_PATHS+=("$path")
-      PROJECT_REPOS+=("$repo")
-    fi
-  done < <(jq -r '.[] | [.name, .path, (.repository // "")] | @tsv' "$SOURCE_JSON" 2>/dev/null)
-elif command -v python3 &> /dev/null; then
-  while IFS=$'\t' read -r name path repo; do
-    if [ -n "$name" ]; then
-      PROJECT_NAMES+=("$name")
-      PROJECT_PATHS+=("$path")
-      PROJECT_REPOS+=("$repo")
-    fi
-  done < <(python3 -c "
-import json
-with open('$SOURCE_JSON', 'r') as f:
-    items = json.load(f)
-for it in items:
-    print(f\"{it.get('name', '')}\t{it.get('path', '')}\t{it.get('repository', '')}\")
-" 2>/dev/null)
-else
-  echo "❌ Error: Neither 'jq' nor 'python3' is available to parse $SOURCE_JSON."
-  exit 1
-fi
-
-if [ ${#PROJECT_NAMES[@]} -eq 0 ]; then
-  echo "❌ Error: No projects registered in $SOURCE_JSON."
-  exit 1
-fi
-
-# 3. Project Selection
-echo ""
-echo "📁 Step 1: Select Project"
-echo "------------------------------------------"
-for i in "${!PROJECT_NAMES[@]}"; do
-  num=$((i + 1))
-  echo "  [$num] ${PROJECT_NAMES[$i]} (${PROJECT_PATHS[$i]})"
-done
+# ANSI Color Codes
+BOLD="\033[1m"
+GREEN="\033[0;32m"
+YELLOW="\033[0;33m"
+BLUE="\033[0;34m"
+CYAN="\033[0;36m"
+MAGENTA="\033[0;35m"
+RED="\033[0;31m"
+DIM="\033[2m"
+RESET="\033[0m"
 
 echo ""
-read -r -p "Enter project number (1-${#PROJECT_NAMES[@]}): " SELECTED_PROJ_IDX
+echo -e "${BOLD}==========================================${RESET}"
+echo -e "${BOLD} 🚀 Create Pull Request Script (GitHub CLI)${RESET}"
+echo -e "${BOLD}==========================================${RESET}"
+echo ""
 
-if ! [[ "$SELECTED_PROJ_IDX" =~ ^[0-9]+$ ]] || [ "$SELECTED_PROJ_IDX" -lt 1 ] || [ "$SELECTED_PROJ_IDX" -gt "${#PROJECT_NAMES[@]}" ]; then
-  echo "❌ Error: Invalid selection."
-  exit 1
-fi
-
-PROJ_INDEX=$((SELECTED_PROJ_IDX - 1))
-SELECTED_PROJ_NAME="${PROJECT_NAMES[$PROJ_INDEX]}"
-SELECTED_PROJ_PATH="${PROJECT_PATHS[$PROJ_INDEX]}"
-SELECTED_PROJ_REPO="${PROJECT_REPOS[$PROJ_INDEX]}"
-
-if [ ! -d "$SELECTED_PROJ_PATH" ]; then
-  echo "❌ Error: Project path does not exist:"
-  echo "   $SELECTED_PROJ_PATH"
-  exit 1
-fi
-
-# Switch context into selected project
-cd "$SELECTED_PROJ_PATH"
-
-# 4. Check GitHub CLI ('gh') & authentication
+# 1. Check GitHub CLI ('gh') & authentication
 if ! command -v gh &> /dev/null; then
-  echo "❌ Error: GitHub CLI ('gh') is not installed or not in PATH."
+  echo -e "${RED}❌ Error: GitHub CLI ('gh') is not installed or not in PATH.${RESET}"
   echo "Please install it or authenticate via 'gh auth login'."
   exit 1
 fi
 
-CURRENT_GH_USER=$(gh api user --jq .login 2>/dev/null || true)
+GH_ERR_FILE=$(mktemp)
+CURRENT_GH_USER=$(gh api user --jq .login 2>"$GH_ERR_FILE" || true)
+
+# Fallback 1: Extract username from 'gh auth status'
 if [ -z "$CURRENT_GH_USER" ]; then
-  echo "❌ Error: Not logged in to GitHub CLI."
+  CURRENT_GH_USER=$(gh auth status 2>&1 | grep -oE "account [a-zA-Z0-9_-]+" | awk '{print $2}' | head -n 1 || true)
+fi
+
+# Fallback 2: Check if gh config has user
+if [ -z "$CURRENT_GH_USER" ]; then
+  CURRENT_GH_USER=$(gh api user -q '.login' 2>/dev/null || true)
+fi
+
+if [ -z "$CURRENT_GH_USER" ]; then
+  echo -e "${RED}❌ Error: Not logged in to GitHub CLI.${RESET}"
+  if [ -s "$GH_ERR_FILE" ]; then
+    echo -e "${YELLOW}API Error Details:${RESET}"
+    cat "$GH_ERR_FILE"
+  fi
+  rm -f "$GH_ERR_FILE"
+  echo ""
   echo "Please run 'gh auth login' to authenticate."
   exit 1
 fi
+rm -f "$GH_ERR_FILE"
 
-# 5. Detect repository
-REPO_FULL_NAME=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
-if [ -z "$REPO_FULL_NAME" ] && [ -n "$SELECTED_PROJ_REPO" ]; then
-  REPO_FULL_NAME="$SELECTED_PROJ_REPO"
-fi
+echo -e "👤 Authenticated as : ${CYAN}${BOLD}@$CURRENT_GH_USER${RESET}"
 
-if [ -z "$REPO_FULL_NAME" ]; then
-  echo "❌ Error: Could not determine GitHub repository for $SELECTED_PROJ_PATH."
-  exit 1
-fi
+# Fetch organizations
+ORGS=()
+while IFS= read -r org; do
+  [ -n "$org" ] && ORGS+=("$org")
+done < <(gh api user/orgs --jq '.[].login' 2>/dev/null || true)
 
-echo ""
-echo "📦 Selected Project : $SELECTED_PROJ_NAME"
-echo "📂 Project Path     : $SELECTED_PROJ_PATH"
-echo "🐙 Repository       : $REPO_FULL_NAME"
-echo "👤 Logged in as     : $CURRENT_GH_USER"
+# 2. Collect all repositories directly from GitHub CLI
+echo -e "📦 Discovering repositories from GitHub..."
+ALL_REPOS=()
 
-# 6. Source (Head) Branch Selection / Confirmation
-echo ""
-echo "------------------------------------------"
-echo "🌿 Step 2: Source (Head) Branch"
-echo "------------------------------------------"
-CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || true)
+# Personal repos
+while IFS= read -r r; do
+  [ -n "$r" ] && ALL_REPOS+=("$r")
+done < <(gh repo list "$CURRENT_GH_USER" --limit 300 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null || true)
 
-if [ -z "$CURRENT_BRANCH" ]; then
-  echo "⚠️ Warning: Not currently on a branch (detached HEAD or empty repository)."
-  read -r -p "Enter source branch name: " HEAD_BRANCH
-  if [ -z "$HEAD_BRANCH" ]; then
-    echo "❌ Error: No source branch specified."
-    exit 1
-  fi
-else
-  echo "Current active branch: $CURRENT_BRANCH"
-  read -r -p "Use '$CURRENT_BRANCH' as PR source branch? (Y/n) [or enter another branch name]: " BRANCH_CHOICE
-  if [ -z "$BRANCH_CHOICE" ] || [[ "$BRANCH_CHOICE" =~ ^[Yy]$ ]]; then
-    HEAD_BRANCH="$CURRENT_BRANCH"
-  elif [[ "$BRANCH_CHOICE" =~ ^[Nn]$ ]]; then
-    read -r -p "Enter source branch name: " CUSTOM_BRANCH
-    if [ -z "$CUSTOM_BRANCH" ]; then
-      echo "❌ Error: No source branch specified."
-      exit 1
-    fi
-    HEAD_BRANCH="$CUSTOM_BRANCH"
-  else
-    HEAD_BRANCH="$BRANCH_CHOICE"
-  fi
-fi
+# Organization repos
+for org in "${ORGS[@]}"; do
+  while IFS= read -r r; do
+    [ -n "$r" ] && ALL_REPOS+=("$r")
+  done < <(gh repo list "$org" --limit 300 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null || true)
+done
 
-# 7. Target (Base) Branch Selection
-echo ""
-echo "------------------------------------------"
-echo "🎯 Step 3: Target (Base) Branch"
-echo "------------------------------------------"
-echo "Fetching remote branches from origin..."
-git fetch origin --prune 2>/dev/null || true
-
-RAW_BRANCHES=()
-while IFS= read -r b; do
-  if [ -n "$b" ] && [ "$b" != "HEAD" ] && [ "$b" != "$HEAD_BRANCH" ]; then
-    RAW_BRANCHES+=("$b")
-  fi
-done < <(git for-each-ref --format="%(refname:strip=3)" refs/remotes/origin/ 2>/dev/null)
-
-# Fallback to local branches if no remote branches found
-if [ ${#RAW_BRANCHES[@]} -eq 0 ]; then
-  while IFS= read -r b; do
-    if [ -n "$b" ] && [ "$b" != "$HEAD_BRANCH" ]; then
-      RAW_BRANCHES+=("$b")
-    fi
-  done < <(git for-each-ref --format="%(refname:strip=2)" refs/heads/ 2>/dev/null)
-fi
-
-# Deduplicate branches preserving order
-UNIQUE_BRANCHES=()
-for b in "${RAW_BRANCHES[@]}"; do
+# Deduplicate
+REPOS=()
+for r in "${ALL_REPOS[@]}"; do
   found=0
-  for u in "${UNIQUE_BRANCHES[@]}"; do
-    if [ "$u" = "$b" ]; then
+  for u in "${REPOS[@]}"; do
+    if [ "$u" = "$r" ]; then
       found=1
       break
     fi
   done
-  if [ $found -eq 0 ]; then
-    UNIQUE_BRANCHES+=("$b")
-  fi
+  [ $found -eq 0 ] && REPOS+=("$r")
 done
 
-# Prioritize main or master at the top
-SORTED_TARGET_BRANCHES=()
-for b in "${UNIQUE_BRANCHES[@]}"; do
-  if [ "$b" = "main" ] || [ "$b" = "master" ]; then
-    SORTED_TARGET_BRANCHES+=("$b")
-  fi
-done
-for b in "${UNIQUE_BRANCHES[@]}"; do
-  if [ "$b" != "main" ] && [ "$b" != "master" ]; then
-    SORTED_TARGET_BRANCHES+=("$b")
-  fi
-done
-
-if [ ${#SORTED_TARGET_BRANCHES[@]} -eq 0 ]; then
-  echo "⚠️ Warning: No candidate target branches detected automatically."
-  read -r -p "Enter target base branch [Default: main]: " CUSTOM_TARGET
-  TARGET_BASE="${CUSTOM_TARGET:-main}"
-else
-  echo "Available target branches:"
-  for i in "${!SORTED_TARGET_BRANCHES[@]}"; do
-    num=$((i + 1))
-    if [ $i -eq 0 ]; then
-      echo "  [$num] ${SORTED_TARGET_BRANCHES[$i]} (default)"
-    else
-      echo "  [$num] ${SORTED_TARGET_BRANCHES[$i]}"
-    fi
-  done
-  echo ""
-  read -r -p "Select target branch by number (or type branch name) [Default: 1 - ${SORTED_TARGET_BRANCHES[0]}]: " TARGET_CHOICE
-  if [ -z "$TARGET_CHOICE" ]; then
-    TARGET_BASE="${SORTED_TARGET_BRANCHES[0]}"
-  elif [[ "$TARGET_CHOICE" =~ ^[0-9]+$ ]] && [ "$TARGET_CHOICE" -ge 1 ] && [ "$TARGET_CHOICE" -le "${#SORTED_TARGET_BRANCHES[@]}" ]; then
-    TARGET_BASE="${SORTED_TARGET_BRANCHES[$((TARGET_CHOICE - 1))]}"
-  else
-    TARGET_BASE="$TARGET_CHOICE"
-  fi
-fi
-
-if [ "$HEAD_BRANCH" = "$TARGET_BASE" ]; then
-  echo "❌ Error: Source branch and target base branch cannot be the same ('$TARGET_BASE')."
+if [ ${#REPOS[@]} -eq 0 ]; then
+  echo -e "${RED}❌ Error: No repositories found on GitHub.${RESET}"
   exit 1
 fi
 
-echo "✅ Source Branch : $HEAD_BRANCH"
-echo "✅ Target Base   : $TARGET_BASE"
-
-# 8. Check for uncommitted changes
-if [ -n "$(git status --porcelain)" ]; then
-  echo ""
-  echo "⚠️ Warning: You have uncommitted changes in '$SELECTED_PROJ_NAME':"
-  git status --short
-  echo ""
-  read -r -p "Do you want to continue without committing these changes? (y/N): " CONTINUE_UNCOMMITTED
-  if [[ ! "$CONTINUE_UNCOMMITTED" =~ ^[Yy]$ ]]; then
-    echo "Aborted. Please commit or stash your changes first."
-    exit 1
-  fi
-fi
-
-# 9. Check if local commits on HEAD_BRANCH are pushed to remote
-git fetch origin "$HEAD_BRANCH" 2>/dev/null || true
-LOCAL_REV=$(git rev-parse "$HEAD_BRANCH" 2>/dev/null || git rev-parse HEAD)
-REMOTE_REV=$(git rev-parse "origin/$HEAD_BRANCH" 2>/dev/null || echo "")
-
-if [ "$LOCAL_REV" != "$REMOTE_REV" ]; then
-  echo ""
-  echo "⚠️ Branch '$HEAD_BRANCH' has unpushed commits."
-  read -r -p "Push changes to 'origin/$HEAD_BRANCH' now? (Y/n): " DO_PUSH
-  if [[ "$DO_PUSH" =~ ^[Nn]$ ]]; then
-    echo "Cannot create PR without pushing branch to remote. Aborted."
-    exit 1
+# 3. Project / Repository Selection
+echo ""
+echo -e "${BOLD}📁 Step 1: Select Repository${RESET}"
+echo "------------------------------------------"
+for i in "${!REPOS[@]}"; do
+  num=$((i + 1))
+  slug="${REPOS[$i]}"
+  owner="${slug%%/*}"
+  repo_name="${slug##*/}"
+  if [ "$owner" = "$CURRENT_GH_USER" ]; then
+    printf "  [%2d] %-30s ${DIM}(personal)${RESET}\n" "$num" "$slug"
   else
-    echo "Pushing '$HEAD_BRANCH' to origin..."
-    git push -u origin "$HEAD_BRANCH"
+    printf "  [%2d] %-30s ${MAGENTA}(org: %s)${RESET}\n" "$num" "$slug" "$owner"
+  fi
+done
+
+echo ""
+read -r -p "Enter repository number (1-${#REPOS[@]}) or type repo name: " SELECTED_INPUT
+
+REPO_FULL_NAME=""
+if [[ "$SELECTED_INPUT" =~ ^[0-9]+$ ]] && [ "$SELECTED_INPUT" -ge 1 ] && [ "$SELECTED_INPUT" -le "${#REPOS[@]}" ]; then
+  REPO_FULL_NAME="${REPOS[$((SELECTED_INPUT - 1))]}"
+elif [ -n "$SELECTED_INPUT" ]; then
+  # Try exact or partial match
+  for r in "${REPOS[@]}"; do
+    if [ "$r" = "$SELECTED_INPUT" ] || [ "${r##*/}" = "$SELECTED_INPUT" ]; then
+      REPO_FULL_NAME="$r"
+      break
+    fi
+  done
+  if [ -z "$REPO_FULL_NAME" ]; then
+    for r in "${REPOS[@]}"; do
+      if [[ "$r" == *"$SELECTED_INPUT"* ]]; then
+        REPO_FULL_NAME="$r"
+        break
+      fi
+    done
   fi
 fi
 
-# 10. Check if a PR already exists
+if [ -z "$REPO_FULL_NAME" ]; then
+  echo -e "${RED}❌ Error: Invalid repository selection.${RESET}"
+  exit 1
+fi
+
+echo -e "✅ Target Repository : ${CYAN}${BOLD}$REPO_FULL_NAME${RESET}"
+
+# 4. Fetch Remote Branches directly from GitHub
+echo ""
+echo -e "${BOLD}🌿 Step 2: Source (Head) Branch${RESET}"
+echo "------------------------------------------"
+echo "Fetching remote branches from GitHub..."
+
+RAW_BRANCHES=()
+while IFS= read -r b; do
+  [ -n "$b" ] && RAW_BRANCHES+=("$b")
+done < <(gh api "repos/$REPO_FULL_NAME/branches" --paginate --jq '.[].name' 2>/dev/null || true)
+
+if [ ${#RAW_BRANCHES[@]} -eq 0 ]; then
+  echo -e "${RED}❌ Error: Could not fetch branches for $REPO_FULL_NAME (empty repository or no branches found).${RESET}"
+  exit 1
+fi
+
+# Detect default branch
+DEFAULT_BRANCH=$(gh repo view "$REPO_FULL_NAME" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || echo "main")
+
+echo "Available branches in $REPO_FULL_NAME:"
+for i in "${!RAW_BRANCHES[@]}"; do
+  num=$((i + 1))
+  b="${RAW_BRANCHES[$i]}"
+  if [ "$b" = "$DEFAULT_BRANCH" ]; then
+    printf "  [%2d] %-30s ${DIM}(default base)${RESET}\n" "$num" "$b"
+  else
+    printf "  [%2d] %-30s\n" "$num" "$b"
+  fi
+done
+
+echo ""
+read -r -p "Select Source (Head) Branch by number or type branch name: " HEAD_CHOICE
+
+HEAD_BRANCH=""
+if [[ "$HEAD_CHOICE" =~ ^[0-9]+$ ]] && [ "$HEAD_CHOICE" -ge 1 ] && [ "$HEAD_CHOICE" -le "${#RAW_BRANCHES[@]}" ]; then
+  HEAD_BRANCH="${RAW_BRANCHES[$((HEAD_CHOICE - 1))]}"
+elif [ -n "$HEAD_CHOICE" ]; then
+  HEAD_BRANCH="$HEAD_CHOICE"
+fi
+
+if [ -z "$HEAD_BRANCH" ]; then
+  echo -e "${RED}❌ Error: No source branch specified.${RESET}"
+  exit 1
+fi
+
+echo -e "✅ Source Branch : ${CYAN}${BOLD}$HEAD_BRANCH${RESET}"
+
+# 5. Target (Base) Branch Selection
+echo ""
+echo -e "${BOLD}🎯 Step 3: Target (Base) Branch${RESET}"
+echo "------------------------------------------"
+
+TARGET_CANDIDATES=()
+for b in "${RAW_BRANCHES[@]}"; do
+  if [ "$b" != "$HEAD_BRANCH" ]; then
+    TARGET_CANDIDATES+=("$b")
+  fi
+done
+
+# Sort default branch to the top
+SORTED_TARGETS=()
+for b in "${TARGET_CANDIDATES[@]}"; do
+  [ "$b" = "$DEFAULT_BRANCH" ] && SORTED_TARGETS+=("$b")
+done
+for b in "${TARGET_CANDIDATES[@]}"; do
+  [ "$b" != "$DEFAULT_BRANCH" ] && SORTED_TARGETS+=("$b")
+done
+
+if [ ${#SORTED_TARGETS[@]} -eq 0 ]; then
+  SORTED_TARGETS=("$DEFAULT_BRANCH")
+fi
+
+echo "Available target branches:"
+for i in "${!SORTED_TARGETS[@]}"; do
+  num=$((i + 1))
+  if [ $i -eq 0 ]; then
+    echo "  [$num] ${SORTED_TARGETS[$i]} (default)"
+  else
+    echo "  [$num] ${SORTED_TARGETS[$i]}"
+  fi
+done
+
+echo ""
+read -r -p "Select target branch by number (or press Enter for default: ${SORTED_TARGETS[0]}): " TARGET_CHOICE
+
+if [ -z "$TARGET_CHOICE" ]; then
+  TARGET_BASE="${SORTED_TARGETS[0]}"
+elif [[ "$TARGET_CHOICE" =~ ^[0-9]+$ ]] && [ "$TARGET_CHOICE" -ge 1 ] && [ "$TARGET_CHOICE" -le "${#SORTED_TARGETS[@]}" ]; then
+  TARGET_BASE="${SORTED_TARGETS[$((TARGET_CHOICE - 1))]}"
+else
+  TARGET_BASE="$TARGET_CHOICE"
+fi
+
+if [ "$HEAD_BRANCH" = "$TARGET_BASE" ]; then
+  echo -e "${RED}❌ Error: Source branch and target base branch cannot be the same ('$TARGET_BASE').${RESET}"
+  exit 1
+fi
+
+echo -e "✅ Source Branch : ${CYAN}${BOLD}$HEAD_BRANCH${RESET}"
+echo -e "✅ Target Base   : ${CYAN}${BOLD}$TARGET_BASE${RESET}"
+
+# 6. Check if PR already exists
 EXISTING_PR=$(gh pr list --repo "$REPO_FULL_NAME" --head "$HEAD_BRANCH" --base "$TARGET_BASE" --json url,number --jq '.[0].url' 2>/dev/null || true)
 if [ -n "$EXISTING_PR" ]; then
   echo ""
-  echo "ℹ️ An open PR already exists for branch '$HEAD_BRANCH' into '$TARGET_BASE':"
-  echo "🔗 $EXISTING_PR"
+  echo -e "ℹ️  ${YELLOW}An open PR already exists for branch '$HEAD_BRANCH' into '$TARGET_BASE':${RESET}"
+  echo -e "🔗 ${CYAN}$EXISTING_PR${RESET}"
   exit 0
 fi
 
-# 11. Collect PR Title & Description (AI-Powered with Confirmation and Manual Fallback)
+# 7. Collect Commits and Code Diffs directly from GitHub Compare API
 echo ""
+echo -e "${BOLD}📝 Step 4: PR Title & Description${RESET}"
 echo "------------------------------------------"
-echo "📝 Step 4: PR Title & Description"
-echo "------------------------------------------"
+echo "Fetching code comparison directly from GitHub..."
 
-# Determine base ref for comparison (prefer origin/$TARGET_BASE to avoid stale local branches)
-COMPARE_BASE="$TARGET_BASE"
-if git rev-parse --verify "origin/$TARGET_BASE" >/dev/null 2>&1; then
-  COMPARE_BASE="origin/$TARGET_BASE"
+# Python helper to extract compare data and call AI if configured
+COMPARE_TMP=$(mktemp)
+python3 - "$REPO_FULL_NAME" "$TARGET_BASE" "$HEAD_BRANCH" > "$COMPARE_TMP" 2>/dev/null << 'EOF'
+import sys, json, subprocess
+
+repo = sys.argv[1]
+base = sys.argv[2]
+head = sys.argv[3]
+
+cmd = ["gh", "api", f"repos/{repo}/compare/{base}...{head}"]
+res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+if res.returncode != 0:
+    sys.exit(1)
+
+try:
+    data = json.loads(res.stdout)
+except Exception:
+    sys.exit(1)
+
+commits = [c.get("commit", {}).get("message", "").strip() for c in data.get("commits", [])]
+files = [f.get("filename", "") for f in data.get("files", [])]
+
+# Diff patches excluding docs and lockfiles
+diff_parts = []
+for f in data.get("files", []):
+    fn = f.get("filename", "")
+    patch = f.get("patch", "")
+    if patch and not any(fn.lower().endswith(x) for x in [".md", ".lock", "lock.json", "lock.yaml", "readme"]):
+        diff_parts.append(f"--- {fn}\n{patch[:600]}")
+    if len(diff_parts) >= 15:
+        break
+
+out = {
+    "total_commits": len(commits),
+    "commits": commits,
+    "files": files[:30],
+    "diff_snippet": "\n\n".join(diff_parts)[:3000]
+}
+print(json.dumps(out))
+EOF
+
+COMPARE_DATA=$(cat "$COMPARE_TMP" 2>/dev/null || echo "{}")
+rm -f "$COMPARE_TMP"
+
+COMMITS_COUNT=$(python3 -c "import json; d=json.loads('''$COMPARE_DATA'''); print(d.get('total_commits', 0))" 2>/dev/null || echo "0")
+if [ "$COMMITS_COUNT" -eq 0 ]; then
+  echo -e "${YELLOW}⚠️ Warning: No new commits found between '$TARGET_BASE' and '$HEAD_BRANCH'.${RESET}"
 fi
 
-DEFAULT_TITLE=$(git log -1 --pretty=%s "$HEAD_BRANCH" 2>/dev/null || git log -1 --pretty=%s)
-
-# Extract commits (with full subjects & bodies)
-COMMITS_LIST=$(git log "$COMPARE_BASE..$HEAD_BRANCH" --pretty=format:"- %s" 2>/dev/null || true)
-if [ -z "$COMMITS_LIST" ]; then
-  COMMITS_LIST=$(git log -10 --pretty=format:"- %s" "$HEAD_BRANCH" 2>/dev/null || true)
-fi
-
-# Extract modified files excluding markdown / documentation
-CHANGED_FILES=$(git diff "$COMPARE_BASE...$HEAD_BRANCH" --name-only -- ":!*README*" ":!*.md" 2>/dev/null | head -n 40 || true)
-if [ -z "$CHANGED_FILES" ]; then
-  CHANGED_FILES=$(git diff "$COMPARE_BASE...$HEAD_BRANCH" --name-only 2>/dev/null | head -n 40 || true)
-fi
-
-# Extract compact diff snippet of actual code logic (excluding docs and lockfiles)
-DIFF_SNIPPET=$(git diff "$COMPARE_BASE...$HEAD_BRANCH" -U1 -- ":!*README*" ":!*.md" ":!*.lock" ":!package-lock.json" ":!pnpm-lock.yaml" 2>/dev/null | head -n 120 || true)
+COMMITS_LIST=$(python3 -c "import json; d=json.loads('''$COMPARE_DATA'''); print('\n'.join(['- ' + c.splitlines()[0] for c in d.get('commits', [])]))" 2>/dev/null || echo "")
+DEFAULT_TITLE=$(python3 -c "import json; d=json.loads('''$COMPARE_DATA'''); print(d.get('commits', [''])[0].splitlines()[0] if d.get('commits') else 'feat: updates')" 2>/dev/null || echo "feat: updates")
 
 GIT_DEFAULT_BODY="### Summary of Changes
 $COMMITS_LIST"
@@ -316,8 +327,7 @@ USE_AI_RESULT=0
 AI_TITLE=""
 AI_BODY=""
 
-if [ -n "$OPENROUTER_API_KEY" ]; then
-  # Spinner for real-time progress while AI is communicating with OpenRouter
+if [ -n "$OPENROUTER_API_KEY" ] && [ "$COMMITS_COUNT" -gt 0 ]; then
   spinner() {
     local pid=$1
     local delay=0.1
@@ -334,14 +344,21 @@ if [ -n "$OPENROUTER_API_KEY" ]; then
   AI_TMP_OUT=$(mktemp)
 
   (
-    python3 - "$COMMITS_LIST" "$CHANGED_FILES" "$DIFF_SNIPPET" "$OPENROUTER_API_KEY" "$OPENROUTER_MODEL" > "$AI_TMP_OUT" 2>/dev/null << 'EOF'
+    python3 - "$COMPARE_DATA" "$OPENROUTER_API_KEY" "$OPENROUTER_MODEL" > "$AI_TMP_OUT" 2>/dev/null << 'EOF'
 import sys, urllib.request, json, re, os
 
-commits = sys.argv[1] if len(sys.argv) > 1 else ""
-changed_files = sys.argv[2] if len(sys.argv) > 2 else ""
-diff_snippet = sys.argv[3] if len(sys.argv) > 3 else ""
-api_key = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else os.getenv("OPENROUTER_API_KEY", "")
-preferred_model = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else os.getenv("OPENROUTER_MODEL", "cohere/north-mini-code:free")
+compare_json_str = sys.argv[1] if len(sys.argv) > 1 else "{}"
+api_key = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else os.getenv("OPENROUTER_API_KEY", "")
+preferred_model = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else os.getenv("OPENROUTER_MODEL", "cohere/north-mini-code:free")
+
+try:
+    data = json.loads(compare_json_str)
+except Exception:
+    data = {}
+
+commits = "\n".join(["- " + c for c in data.get("commits", [])])
+changed_files = "\n".join(data.get("files", []))
+diff_snippet = data.get("diff_snippet", "")
 
 models = [preferred_model, "cohere/north-mini-code:free", "qwen/qwen3.8-27b:free", "liquid/lfm-2.5-2.6b:free", "z-ai/glm-5.2:free"]
 seen = set()
@@ -359,11 +376,11 @@ Code Changes Sample:
 {diff_snippet}
 
 CRITICAL RULES:
-1. NEVER mention line counts, number of lines added/modified/deleted, or raw git statistics (e.g., STRICTLY FORBIDDEN to say "Added 137 lines", "Modified 240 lines").
-2. DO NOT mention README or documentation changes in the summary or key changes. Focus on code, logic, features, and fixes.
-3. TITLE: Must be a concise, specific Conventional Commit title explaining WHAT feature/fix was actually built (e.g. 'feat(auth): add user session validation' or 'feat(game): implement tile match puzzle engine'). NEVER use vague titles like 'Add new features', 'Updates', or 'Misc changes'.
-4. SUMMARY: 2-3 clear, readable bullet points describing the business/technical purpose of the changes.
-5. KEY CHANGES: High-level technical bullet points explaining what actually changed in the application logic, UI components, APIs, database, or backend handlers.
+1. NEVER mention line counts, number of lines added/modified/deleted, or raw git statistics.
+2. DO NOT mention README or documentation changes in summary or key changes. Focus on code, logic, features, and fixes.
+3. TITLE: Must be a concise Conventional Commit title explaining WHAT feature/fix was actually built (e.g. 'feat(auth): add user session validation').
+4. SUMMARY: 2-3 clear bullet points describing the business/technical purpose of the changes.
+5. KEY CHANGES: High-level technical bullet points explaining what actually changed in application logic, UI, APIs, database, or backend handlers.
 
 Output ONLY valid JSON in this exact structure without markdown code blocks:
 {{"title": "...", "description": "### Summary\\n- ...\\n\\n### Key Changes\\n- ..."}}
@@ -406,12 +423,13 @@ EOF
     AI_TITLE="${CONTENT%%$'\n'__AI_SEP__*}"
     AI_BODY="${CONTENT#*__AI_SEP__$'\n'}"
 
-    echo "✨ AI has generated PR details:"
+    echo ""
+    echo -e "${BOLD}✨ AI has generated PR details:${RESET}"
     echo "=========================================="
-    echo "📌 Title:"
+    echo -e "📌 ${BOLD}Title:${RESET}"
     echo "   $AI_TITLE"
     echo ""
-    echo "📄 Description:"
+    echo -e "📄 ${BOLD}Description:${RESET}"
     echo "$AI_BODY"
     echo "=========================================="
     echo ""
@@ -421,16 +439,16 @@ EOF
       USE_AI_RESULT=1
       PR_TITLE="$AI_TITLE"
       PR_BODY="$AI_BODY"
-      echo "✅ Accepted AI suggestions."
+      echo -e "${GREEN}✅ Accepted AI suggestions.${RESET}"
     else
-      echo "ℹ️ AI suggestions rejected. Switching to manual input mode..."
+      echo "ℹ️  AI suggestions rejected. Switching to manual input mode..."
     fi
   else
-    echo "⚠️ Note: AI generation was unavailable. Switching to manual input mode..."
+    echo "⚠️  AI generation unavailable. Switching to manual input mode..."
   fi
 fi
 
-# Manual input mode if AI was not configured, failed, or rejected by user
+# Manual input mode if AI was not configured, failed, or rejected
 if [ "$USE_AI_RESULT" -eq 0 ]; then
   echo ""
   echo "--- PR Title ---"
@@ -451,7 +469,7 @@ if [ "$USE_AI_RESULT" -eq 0 ]; then
   fi
 fi
 
-# Helper function to parse user selection from list (macOS Bash 3.2 compatible, no local -n)
+# Helper function to parse user selection from list (macOS Bash 3.2 compatible)
 parse_selections() {
   local input="$1"
   shift
@@ -464,10 +482,9 @@ parse_selections() {
   done
 }
 
-# 12. Reviewers & Assignees
+# 8. Reviewers & Assignees
 echo ""
-echo "------------------------------------------"
-echo "👥 Step 5: Reviewers & Assignees"
+echo -e "${BOLD}👥 Step 5: Reviewers & Assignees${RESET}"
 echo "------------------------------------------"
 echo "Fetching team members from repository..."
 MEMBERS=()
@@ -509,10 +526,9 @@ if [ -n "$SELECTED_ASG_INPUT" ]; then
   done < <(parse_selections "$SELECTED_ASG_INPUT" "${MEMBERS[@]}")
 fi
 
-# 13. Labels
+# 9. Labels
 echo ""
-echo "------------------------------------------"
-echo "🏷️ Step 6: Labels"
+echo -e "${BOLD}🏷️  Step 6: Labels${RESET}"
 echo "------------------------------------------"
 echo "Fetching labels from repository..."
 LABELS=()
@@ -540,43 +556,39 @@ fi
 
 # Build extra gh pr create arguments
 EXTRA_FLAGS=()
-
 for rev in "${SELECTED_REVIEWERS[@]}"; do
   EXTRA_FLAGS+=(--reviewer "$rev")
 done
-
 for asg in "${SELECTED_ASSIGNEES[@]}"; do
   EXTRA_FLAGS+=(--assignee "$asg")
 done
-
 for lbl in "${SELECTED_LABELS[@]}"; do
   EXTRA_FLAGS+=(--label "$lbl")
 done
 
-# 14. Confirmation before creating PR
+# 10. Confirmation before creating PR
 echo ""
-echo "=========================================="
-echo " 📋 Review PR Summary Before Creation"
-echo "=========================================="
-echo "• Project     : $SELECTED_PROJ_NAME ($SELECTED_PROJ_PATH)"
-echo "• Repository  : $REPO_FULL_NAME"
-echo "• Base Branch : $TARGET_BASE"
-echo "• Head Branch : $HEAD_BRANCH"
-echo "• Title       : $PR_TITLE"
+echo -e "${BOLD}==========================================${RESET}"
+echo -e "${BOLD} 📋 Review PR Summary Before Creation${RESET}"
+echo -e "${BOLD}==========================================${RESET}"
+echo -e "• Repository  : ${CYAN}$REPO_FULL_NAME${RESET}"
+echo -e "• Base Branch : ${CYAN}$TARGET_BASE${RESET}"
+echo -e "• Head Branch : ${CYAN}$HEAD_BRANCH${RESET}"
+echo -e "• Title       : $PR_TITLE"
 if [ ${#SELECTED_REVIEWERS[@]} -gt 0 ]; then
-  echo "• Reviewers   : ${SELECTED_REVIEWERS[*]}"
+  echo -e "• Reviewers   : ${SELECTED_REVIEWERS[*]}"
 else
-  echo "• Reviewers   : (None)"
+  echo -e "• Reviewers   : (None)"
 fi
 if [ ${#SELECTED_ASSIGNEES[@]} -gt 0 ]; then
-  echo "• Assignees   : ${SELECTED_ASSIGNEES[*]}"
+  echo -e "• Assignees   : ${SELECTED_ASSIGNEES[*]}"
 else
-  echo "• Assignees   : (None)"
+  echo -e "• Assignees   : (None)"
 fi
 if [ ${#SELECTED_LABELS[@]} -gt 0 ]; then
-  echo "• Labels      : ${SELECTED_LABELS[*]}"
+  echo -e "• Labels      : ${SELECTED_LABELS[*]}"
 else
-  echo "• Labels      : (None)"
+  echo -e "• Labels      : (None)"
 fi
 echo "=========================================="
 echo ""
@@ -587,16 +599,18 @@ if [[ "$CONFIRM" =~ ^[Nn]$ ]]; then
   exit 0
 fi
 
-# 15. Create the Pull Request
+# 11. Create the Pull Request
 echo ""
 echo "Creating pull request on GitHub..."
-gh pr create \
+PR_URL=$(gh pr create \
   --repo "$REPO_FULL_NAME" \
   --base "$TARGET_BASE" \
   --head "$HEAD_BRANCH" \
   --title "$PR_TITLE" \
   --body "$PR_BODY" \
-  "${EXTRA_FLAGS[@]}"
+  "${EXTRA_FLAGS[@]}" 2>&1)
 
 echo ""
-echo "✅ Pull Request created successfully!"
+echo -e "${GREEN}${BOLD}✅ Pull Request created successfully!${RESET}"
+echo -e "🔗 $PR_URL"
+echo ""
