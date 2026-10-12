@@ -71,36 +71,105 @@ while IFS= read -r org; do
   [ -n "$org" ] && ORGS+=("$org")
 done < <(gh api user/orgs --jq '.[].login' 2>/dev/null || true)
 
-# 2. Collect all repositories directly from GitHub CLI
+# 2. Collect and categorize repositories via GitHub CLI
 echo -e "📦 Discovering repositories from GitHub..."
-ALL_REPOS=()
 
-# Personal repos
-while IFS= read -r r; do
-  [ -n "$r" ] && ALL_REPOS+=("$r")
-done < <(gh repo list "$CURRENT_GH_USER" --limit 300 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null || true)
+REPO_DATA_TMP=$(mktemp)
+python3 - "$CURRENT_GH_USER" "${ORGS[@]}" > "$REPO_DATA_TMP" 2>/dev/null << 'EOF'
+import sys, json, subprocess
+from datetime import datetime, timezone, timedelta
 
-# Organization repos
-for org in "${ORGS[@]}"; do
-  while IFS= read -r r; do
-    [ -n "$r" ] && ALL_REPOS+=("$r")
-  done < <(gh repo list "$org" --limit 300 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null || true)
-done
+current_user = sys.argv[1]
+orgs = sys.argv[2:]
 
-# Deduplicate
+now = datetime.now(timezone.utc)
+two_days_ago = now - timedelta(days=2)
+
+def parse_iso(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def format_relative(dt):
+    if not dt:
+        return ""
+    diff = now - dt
+    secs = int(diff.total_seconds())
+    if secs < 3600:
+        mins = max(1, secs // 60)
+        return f"{mins}m ago"
+    hours = secs // 3600
+    if hours < 24:
+        return f"today, {hours}h ago"
+    elif hours < 48:
+        return f"yesterday, {hours}h ago"
+    else:
+        days = hours // 24
+        return f"{days}d ago"
+
+def get_repos(owner):
+    cmd = ["gh", "repo", "list", owner, "--limit", "300", "--json", "nameWithOwner,pushedAt"]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    try:
+        return json.loads(res.stdout or "[]")
+    except Exception:
+        return []
+
+all_repos = []
+user_repos = get_repos(current_user)
+all_repos.extend(user_repos)
+
+for org in orgs:
+    org_repos = get_repos(org)
+    all_repos.extend(org_repos)
+
+seen = set()
+recent = []
+others = []
+
+for r in all_repos:
+    slug = r.get("nameWithOwner")
+    if not slug or slug in seen:
+        continue
+    seen.add(slug)
+    
+    pt = parse_iso(r.get("pushedAt"))
+    rel_str = format_relative(pt)
+    owner = slug.split("/")[0]
+    badge = "(personal)" if owner == current_user else f"(org: {owner})"
+    
+    entry = {
+        "slug": slug,
+        "pushed_at": r.get("pushedAt"),
+        "rel_time": rel_str,
+        "badge": badge
+    }
+    
+    if pt and pt >= two_days_ago:
+        entry["parsed_time"] = pt.timestamp()
+        recent.append(entry)
+    else:
+        others.append(entry)
+
+# Sort recent by newest push first
+recent.sort(key=lambda x: x.get("parsed_time", 0), reverse=True)
+# Sort others alphabetically
+others.sort(key=lambda x: x["slug"].lower())
+
+print(json.dumps({"recent": recent, "others": others}))
+EOF
+
+REPO_DATA=$(cat "$REPO_DATA_TMP" 2>/dev/null || echo '{"recent":[],"others":[]}')
+rm -f "$REPO_DATA_TMP"
+
 REPOS=()
-for r in "${ALL_REPOS[@]}"; do
-  found=0
-  for u in "${REPOS[@]}"; do
-    if [ "$u" = "$r" ]; then
-      found=1
-      break
-    fi
-  done
-  [ $found -eq 0 ] && REPOS+=("$r")
-done
+RECENT_COUNT=$(python3 -c "import json; d=json.loads('''$REPO_DATA'''); print(len(d.get('recent', [])))" 2>/dev/null || echo "0")
+TOTAL_COUNT=$(python3 -c "import json; d=json.loads('''$REPO_DATA'''); print(len(d.get('recent', [])) + len(d.get('others', [])))" 2>/dev/null || echo "0")
 
-if [ ${#REPOS[@]} -eq 0 ]; then
+if [ "$TOTAL_COUNT" -eq 0 ]; then
   echo -e "${RED}❌ Error: No repositories found on GitHub.${RESET}"
   exit 1
 fi
@@ -108,21 +177,54 @@ fi
 # 3. Project / Repository Selection
 echo ""
 echo -e "${BOLD}📁 Step 1: Select Repository${RESET}"
-echo "------------------------------------------"
-for i in "${!REPOS[@]}"; do
-  num=$((i + 1))
-  slug="${REPOS[$i]}"
-  owner="${slug%%/*}"
-  repo_name="${slug##*/}"
-  if [ "$owner" = "$CURRENT_GH_USER" ]; then
-    printf "  [%2d] %-30s ${DIM}(personal)${RESET}\n" "$num" "$slug"
-  else
-    printf "  [%2d] %-30s ${MAGENTA}(org: %s)${RESET}\n" "$num" "$slug" "$owner"
-  fi
-done
+echo "----------------------------------------------------------------------"
 
+CURR_NUM=1
+
+# Display Recently Active (past 2 days)
+if [ "$RECENT_COUNT" -gt 0 ]; then
+  echo -e "${YELLOW}${BOLD}🔥 Recently Active Repositories (Committed in past 2 days):${RESET}"
+  while IFS=$'\t' read -r slug rel_time badge; do
+    if [ -n "$slug" ]; then
+      REPOS+=("$slug")
+      printf "  [%2d] %-32s ${GREEN}%-20s${RESET} ${DIM}%s${RESET}\n" "$CURR_NUM" "$slug" "(pushed $rel_time)" "$badge"
+      CURR_NUM=$((CURR_NUM + 1))
+    fi
+  done < <(python3 -c "
+import json
+d = json.loads('''$REPO_DATA''')
+for r in d.get('recent', []):
+    print(f\"{r['slug']}\t{r['rel_time']}\t{r['badge']}\")
+" 2>/dev/null)
+  echo ""
+fi
+
+# Display Other Repositories
+OTHERS_COUNT=$((TOTAL_COUNT - RECENT_COUNT))
+if [ "$OTHERS_COUNT" -gt 0 ]; then
+  echo -e "${BOLD}📁 Other Repositories:${RESET}"
+  while IFS=$'\t' read -r slug rel_time badge; do
+    if [ -n "$slug" ]; then
+      REPOS+=("$slug")
+      if [ -n "$rel_time" ]; then
+        printf "  [%2d] %-32s ${DIM}%-20s %s${RESET}\n" "$CURR_NUM" "$slug" "(pushed $rel_time)" "$badge"
+      else
+        printf "  [%2d] %-32s ${DIM}%s${RESET}\n" "$CURR_NUM" "$slug" "$badge"
+      fi
+      CURR_NUM=$((CURR_NUM + 1))
+    fi
+  done < <(python3 -c "
+import json
+d = json.loads('''$REPO_DATA''')
+for r in d.get('others', []):
+    print(f\"{r['slug']}\t{r['rel_time']}\t{r['badge']}\")
+" 2>/dev/null)
+fi
+
+echo "----------------------------------------------------------------------"
 echo ""
-read -r -p "Enter repository number (1-${#REPOS[@]}) or type repo name: " SELECTED_INPUT
+read -r -p "Enter repository number (1-${#REPOS[@]}) [Default: 1 - ${REPOS[0]}]: " SELECTED_INPUT
+SELECTED_INPUT="${SELECTED_INPUT:-1}"
 
 REPO_FULL_NAME=""
 if [[ "$SELECTED_INPUT" =~ ^[0-9]+$ ]] && [ "$SELECTED_INPUT" -ge 1 ] && [ "$SELECTED_INPUT" -le "${#REPOS[@]}" ]; then
